@@ -16,6 +16,7 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Shape/IR/Shape.h"
 #include "mlir/IR/Matchers.h"
 #include "torch-mlir/Conversion/Utils/Utils.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchDialect.h"
@@ -244,6 +245,21 @@ public:
 };
 } // namespace
 
+// IndexTensor for multiple input tensors broadcasts their shapes to a common
+// shape and then replaces the indexed dims with the indices given by the
+// indexing tensors:
+// x[i_1, i_2, ..., i_M] = result
+// result[...] = x[i_1[...], i_2[...], ..., i_M[...]]
+//
+// where the result shape is computed as follows:
+// 1. broadcast i_1, i_2, ..., i_M to a common shape
+// 2. if i_1, i_2, ..., i_M is not contiguous, transpose the broadcasted
+//    shape to the beginning of the result shape, while removing the
+//    unchanged dims (marked by None)
+// 3. Otherwise replace the indexed dims with the broadcasted shape
+//
+// e.g. x: [2, 3]
+//      x[[4], [6, 1]] -> x[6, 4]
 namespace {
 class ConvertAtenIndexTensorOp : public OpConversionPattern<AtenIndexTensorOp> {
 public:
@@ -251,6 +267,7 @@ public:
   LogicalResult
   matchAndRewrite(AtenIndexTensorOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+
     if (failed(verifyLinalgCompatibleTypes(op, rewriter)))
       return failure();
 
@@ -266,78 +283,161 @@ public:
     SmallVector<Value> indicesVal =
         getTypeConvertedValues(rewriter, loc, getTypeConverter(), indicesTuple);
 
-    int indexTensorDim = -1;
+    SmallVector<int> indexTensorDims;
+    bool contiguous = true;
     for (auto i : llvm::seq(0, (int)indicesVal.size())) {
-      Value index = indicesVal[i];
-      if (!index || failed(checkNotNone(rewriter, op, index)))
-        continue;
-      if (indexTensorDim >= 0) {
-        return rewriter.notifyMatchFailure(
-            op, "unimplemented: only one index tensor allowed");
-      }
-      indexTensorDim = i;
+        Value index = indicesVal[i];
+        if (!index || failed(checkNotNone(rewriter, op, index)))
+          continue;
+        if (indexTensorDims.size())
+          if (indexTensorDims.back() != i - 1)
+            contiguous = false;
+        indexTensorDims.push_back(i);
     }
 
-    if (indexTensorDim == -1) {
+    if (!indexTensorDims.size()) {
       return rewriter.notifyMatchFailure(
           op, "unimplemented: index tensor must not be None");
     }
 
-    Value indexTensor = indicesVal[indexTensorDim];
     RankedTensorType inputType = input.getType().cast<RankedTensorType>();
-    RankedTensorType indexTensorType =
-        indexTensor.getType().cast<RankedTensorType>();
     RankedTensorType resultType = getTypeConverter()
                                       ->convertType(op->getResult(0).getType())
                                       .cast<RankedTensorType>();
     Type elementType = resultType.getElementType();
     int inputRank = inputType.getRank();
-    int indexTensorRank = indexTensorType.getRank();
+    int resultRank = resultType.getRank();
+    int firstIndexDim = indexTensorDims[0];
+    int replacedIndexCount = indexTensorDims.size();
+
+    SmallVector<int> indexRanks;
+    SmallVector<Value> indexTensors;
+    for (auto i : indexTensorDims) {
+      indexTensors.push_back(indicesVal[i]);
+      RankedTensorType indexTensorType =
+          indexTensors.back().getType().cast<RankedTensorType>();
+      indexRanks.push_back(indexTensorType.getRank());
+    }
+
+    int maxRankIndex = std::distance(indexRanks.begin(),
+            std::max_element(indexRanks.begin(), indexRanks.end()));
+    int maxRank = indexRanks[maxRankIndex];
+    Value maxRankIndexTensor = indexTensors[maxRankIndex];
+
+    SmallVector<Value> broadcastedIndexShape;
+
+    // Currently we only support statically sized index tensors
+    // when there is more than one index tensor.
+    // TODO: Add support for dynamic size index tensors. This will probably
+    // require broadcasting the index tensors to a common shape.
+    if (indexTensorDims.size() > 1) {
+      for (auto i : llvm::seq(0, (int)indexTensors.size())) {
+        Value indexTensor = indexTensors[i];
+        RankedTensorType indexTensorType =
+          indexTensor.getType().cast<RankedTensorType>();
+        auto indexTensorShape = indexTensorType.getShape();
+        if (llvm::any_of(indexTensorShape, ShapedType::isDynamic)) {
+          return rewriter.notifyMatchFailure(op,
+                  "unimplemented: index tensors must have static shape if there is more than one index tensor");
+        }
+      }
+      SmallVector<Value> indexTensorExtents;
+      for (auto indexTensor : indexTensors) {
+        indexTensorExtents.push_back(rewriter.createOrFold<shape::ShapeOfOp>(loc, indexTensor));
+      }
+      Value broadcastedShape = rewriter.createOrFold<shape::BroadcastOp>(loc,
+              shape::getExtentTensorType(op->getContext(), maxRank), indexTensorExtents);
+      for (auto i : llvm::seq(0, maxRank)) {
+        broadcastedIndexShape.push_back(rewriter.createOrFold<shape::GetExtentOp>(loc, broadcastedShape, i));
+      }
+    } else {
+      for (auto i : llvm::seq(0, maxRank)) {
+        broadcastedIndexShape.push_back(getDimOp(rewriter, loc, maxRankIndexTensor, i));
+      }
+    }
 
     // This result shape calculation assumes that there is only one
-    // index tensor of the input tensor. The calculation for arbitrary inputs is
-    // much more complex.
+    // index tensor, or all of the index tensors are statically shaped.
+
+    int broadcastRank = broadcastedIndexShape.size();
+
     SmallVector<Value> resultShape;
-    for (auto i : llvm::seq(0, indexTensorDim)) {
-      resultShape.push_back(getDimOp(rewriter, loc, input, i));
+    if (contiguous) {
+      for (auto i : llvm::seq(0, firstIndexDim)) {
+        resultShape.push_back(getDimOp(rewriter, loc, input, i));
+      }
+      resultShape.append(broadcastedIndexShape);
+      for (auto i : llvm::seq((int)resultShape.size(), resultRank)) {
+        resultShape.push_back(getDimOp(rewriter, loc, input, i - broadcastRank + replacedIndexCount));
+      }
+    } else {
+      resultShape.append(broadcastedIndexShape);
+      int j = 0;
+      for (auto i : llvm::seq(0, inputRank)) {
+        if (i == indexTensorDims[j]) {
+          j++;
+          continue;
+        }
+        resultShape.push_back(getDimOp(rewriter, loc, input, i));
+      }
     }
-    for (auto i : llvm::seq(0, indexTensorRank)) {
-      resultShape.push_back(getDimOp(rewriter, loc, indexTensor, i));
-    }
-    for (auto i : llvm::seq(indexTensorDim + 1, inputRank)) {
-      resultShape.push_back(getDimOp(rewriter, loc, input, i));
-    }
-    int resultRank = resultShape.size();
 
     Value initTensor =
         rewriter.create<linalg::InitTensorOp>(loc, resultShape, elementType);
-    SmallVector<AffineExpr> indicesExpr, resultExpr;
+    SmallVector<AffineMap> indexingMaps;
     SmallVector<StringRef> iteratorTypes;
 
-    for (auto i : llvm::seq(indexTensorDim, indexTensorDim + indexTensorRank))
-      indicesExpr.push_back(rewriter.getAffineDimExpr(i));
+    for (auto indexTensor : indexTensors) {
+      RankedTensorType indexTensorType =
+        indexTensor.getType().cast<RankedTensorType>();
+      auto indexTensorShape = indexTensorType.getShape();
+      int rank = indexTensorShape.size();
+      SmallVector<AffineExpr> indicesExpr;
+      for (auto dim : llvm::seq(0, rank)) {
+        if (indexTensorShape[dim] == 1) {
+          indicesExpr.push_back(rewriter.getAffineConstantExpr(0));
+          continue;
+        }
+        indicesExpr.push_back(rewriter.getAffineDimExpr(contiguous ? firstIndexDim + maxRank - rank + dim
+                : maxRank - rank + dim));
+      }
+      indexingMaps.push_back(AffineMap::get(resultRank, 0, indicesExpr, op->getContext()));
+    }
+
+    SmallVector<AffineExpr> resultExpr;
     for (auto i : llvm::seq(0, resultRank)) {
       resultExpr.push_back(rewriter.getAffineDimExpr(i));
       iteratorTypes.push_back(getParallelIteratorTypeName());
     }
-    auto indexingMaps = AffineMap::inferFromExprList({indicesExpr, resultExpr});
+
+    indexingMaps.push_back(AffineMap::get(resultRank, 0, resultExpr, op->getContext()));
 
     Value finalRes =
         rewriter
             .create<linalg::GenericOp>(
-                loc, initTensor.getType(), indexTensor, initTensor,
+                loc, initTensor.getType(), indexTensors, initTensor,
                 indexingMaps, iteratorTypes,
                 [&](OpBuilder &b, Location loc, ValueRange args) {
-                  Value index = castIntToIndex(b, loc, args[0]);
                   SmallVector<Value> extractionIndices;
-                  int extra_dims = 0;
-                  for (auto i : llvm::seq(0, inputRank)) {
-                    if (i == indexTensorDim) {
-                      extractionIndices.push_back(index);
-                      extra_dims += indexTensorRank - 1;
-                    } else {
-                      extractionIndices.push_back(
-                          b.create<linalg::IndexOp>(loc, i + extra_dims));
+                  if (contiguous) {
+                    for (auto i : llvm::seq(0, firstIndexDim)) {
+                      extractionIndices.push_back(b.create<linalg::IndexOp>(loc, i));
+                    }
+                    for (auto i : llvm::seq(0, (int)indexTensorDims.size())) {
+                      extractionIndices.push_back(castIntToIndex(b, loc, args[i]));
+                    }
+                    for (auto i : llvm::seq((int)extractionIndices.size(), inputRank)) {
+                      extractionIndices.push_back(b.create<linalg::IndexOp>(loc, i + broadcastRank - replacedIndexCount));
+                    }
+                  } else {
+                    int indexCount = 0, unchanged = 0;
+                    for (auto i : llvm::seq(0, inputRank)) {
+                      if (i == indexTensorDims[indexCount]) {
+                        extractionIndices.push_back(castIntToIndex(b, loc, args[indexCount++]));
+                        continue;
+                      }
+                      extractionIndices.push_back(b.create<linalg::IndexOp>(loc, broadcastRank + unchanged));
+                      unchanged++;
                     }
                   }
                   Value extractedElement = b.create<tensor::ExtractOp>(
