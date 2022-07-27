@@ -391,6 +391,22 @@ static Value createLinalgPayloadCalculationForElementwiseOp(
       return b.create<arith::MulIOp>(loc, lhs, rhs);
     }
   }
+  if (auto atan2 = dyn_cast<AtenAtan2Op>(op)) {
+    Type lhsDtype = payloadArgs[0].getType();
+    Type rhsDtype = payloadArgs[1].getType();
+    if (lhsDtype != rhsDtype) {
+      atan2.emitError("unimplemented: lhs and rhs type must be the same");
+      return nullptr;
+    }
+    Type dtype = converter->convertType(atan2.getType())
+                     .cast<RankedTensorType>()
+                     .getElementType();
+    if (dtype != lhsDtype) {
+      atan2.emitError("unimplemented: argument and result type must be the same");
+      return nullptr;
+    }
+    return b.create<math::Atan2Op>(loc, payloadArgs[0], payloadArgs[1]);
+  }
   if (auto gtTensor = dyn_cast<AtenGtTensorOp>(op)) {
     AtenGtTensorOp::Adaptor adaptor(operands);
     Type lhsDtype = payloadArgs[0].getType();
@@ -926,7 +942,7 @@ public:
                   ConversionPatternRewriter &rewriter) const override {
     if (!isa<AtenTanhOp, AtenReluOp, AtenLeakyReluOp, AtenGeluOp,
              AtenGeluBackwardOp, AtenAddTensorOp, AtenMulTensorOp,
-             AtenDivTensorOp, AtenDivTensorModeOp, AtenSubTensorOp,
+             AtenDivTensorOp, AtenDivTensorModeOp, AtenSubTensorOp, AtenAtan2Op,
              AtenLerpTensorOp, AtenSigmoidOp, AtenExpOp, AtenExpm1Op,
              AtenMinimumOp, AtenMaximumOp, AtenToDtypeOp, AtenClampOp,
              AtenRsubScalarOp, AtenMulScalarOp, AtenLogOp, AtenErfOp,
@@ -1668,7 +1684,7 @@ void mlir::torch::torch_to_linalg::populateUncategorizedPatternsAndLegality(
   target.addIllegalOp<
       AtenTanhOp, AtenReluOp, AtenLeakyReluOp, AtenGeluOp, AtenGeluBackwardOp,
       AtenAddTensorOp, AtenMulTensorOp, AtenDivTensorOp, AtenDivTensorModeOp,
-      AtenSubTensorOp, AtenLerpTensorOp, AtenSigmoidOp, AtenMinimumOp,
+      AtenSubTensorOp, AtenLerpTensorOp, AtenSigmoidOp, AtenMinimumOp, AtenAtan2Op,
       AtenMaximumOp, AtenToDtypeOp, AtenClampOp, AtenRsubScalarOp, AtenLogOp,
       AtenErfOp, AtenSqrtOp, AtenFloorOp, AtenCeilOp, AtenPowTensorScalarOp,
       AtenLog2Op, AtenLog1pOp, AtenRsqrtOp, AtenAbsOp, AtenReciprocalOp,

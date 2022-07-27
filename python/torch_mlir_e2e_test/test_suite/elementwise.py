@@ -804,6 +804,29 @@ def ElementwiseMulTensorIntModule_basic(module, tu: TestUtils):
 # ==============================================================================
 
 
+class ElementwiseAtan2TensorFloatModule(torch.nn.Module):
+
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args([
+        None,
+        ([-1], torch.float32, True),
+        ([-1], torch.float32, True),
+    ])
+    def forward(self, a, b):
+        return torch.atan2(a, b)
+
+
+@register_test_case(module_factory=lambda: ElementwiseAtan2TensorFloatModule())
+def ElementwiseAtan2TensorFloatModule_basic(module, tu: TestUtils):
+    module.forward(tu.rand(4, 4), tu.rand(4, 4))
+
+
+# ==============================================================================
+
+
 class ElementwiseLogModule(torch.nn.Module):
 
     def __init__(self):

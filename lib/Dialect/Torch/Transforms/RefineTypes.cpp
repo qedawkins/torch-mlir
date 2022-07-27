@@ -722,7 +722,7 @@ void TypeAnalysis::visitOperation(Operation *op,
 
   // Promote the two dtypes assuming possibly-zero rank.
   if (isa<AtenAddTensorOp, AtenSubTensorOp, AtenMulTensorOp, AtenDivTensorOp,
-          AtenDivTensorModeOp, Aten__And__TensorOp, AtenMinimumOp,
+          AtenDivTensorModeOp, Aten__And__TensorOp, AtenMinimumOp, AtenAtan2Op,
           AtenMaximumOp, AtenBitwiseAndTensorOp, AtenThresholdBackwardOp,
           AtenFloorDivideOp>(op)) {
     auto knowledge =
