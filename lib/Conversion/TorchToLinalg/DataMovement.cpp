@@ -958,6 +958,7 @@ public:
   LogicalResult
   matchAndRewrite(AtenSliceTensorOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+
     if (failed(verifyLinalgCompatibleTypes(op, rewriter)))
       return failure();
 
@@ -982,6 +983,7 @@ public:
         loc, input, offsets, resultShape, strides);
 
     rewriter.replaceOpWithNewOp<tensor::CastOp>(op, resultType, result);
+
     return success();
   }
 };

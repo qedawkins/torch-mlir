@@ -230,6 +230,40 @@ public:
 } // namespace
 
 namespace {
+class DecomposeAtenNarrowOp : public OpRewritePattern<AtenNarrowOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(AtenNarrowOp op,
+                                PatternRewriter &rewriter) const override {
+
+    Location loc = op.getLoc();
+    Value start = op.start();
+    Value dim = op.dim();
+    Value length = op.length();
+
+    // Create a value of type ConstantIntOp that contains the int value 1.
+    Value one =
+        rewriter.create<ConstantIntOp>(loc, rewriter.getI64IntegerAttr(1));
+
+    // Create a value of type ConstantIntOp that creates a sum of the values
+    // start and length
+    Value startPlusLength =
+        rewriter.create<AtenAddIntOp>(loc, one.getType(), start, length);
+
+    // `aten.slice.tensor` doesn't squeeze the dim even when it's size 1 after
+    // slicing, while `aten.select.int` does.
+
+    // Replaces the AtenSliceTensorOp op, provides values from the nearly identical aten::narrow
+    rewriter.replaceOpWithNewOp<AtenSliceTensorOp>(
+        op, op.getResult().getType(), op.self(), /*dim*/ dim, /*start*/ start,
+        /*end*/ startPlusLength, /*step=*/one);
+
+    return success();
+  }
+};
+} // namespace
+
+namespace {
 class DecomposeAtenZeroOp
     : public OpRewritePattern<AtenZeroOp> {
 public:
@@ -2427,6 +2461,8 @@ class DecomposeComplexOpsPass
     target.addIllegalOp<AtenSelectScatterOp>();
     patterns.add<DecomposeAtenVarDimOp>(context);
     target.addIllegalOp<AtenVarDimOp>();
+    patterns.add<DecomposeAtenNarrowOp>(context);
+    target.addIllegalOp<AtenNarrowOp>();
 
     if (failed(applyPartialConversion(getOperation(), target,
                                       std::move(patterns)))) {
