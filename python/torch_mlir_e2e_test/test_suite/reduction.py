@@ -87,6 +87,25 @@ def ReduceSumDimIntListDtypeFloatModule_basic(module, tu: TestUtils):
 
 # ==============================================================================
 
+class ReduceSumDimIntListDtypeBoolModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args([
+        None,
+        ([1, 128], torch.bool, True),
+    ])
+    def forward(self, a):
+        return torch.sum(a, [-1])
+
+
+@register_test_case(module_factory=lambda: ReduceSumDimIntListDtypeBoolModule())
+def ReduceSumDimIntListDtypeBoolModule_basic(module, tu: TestUtils):
+    module.forward(torch.ones(1, 128, dtype=torch.bool))
+
+# ==============================================================================
+
 class ReduceSumDimIntListKeepDimFloatModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
