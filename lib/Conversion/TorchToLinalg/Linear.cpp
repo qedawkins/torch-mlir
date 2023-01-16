@@ -16,6 +16,7 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/IR/Matchers.h"
 #include "torch-mlir/Conversion/Utils/Utils.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchDialect.h"
@@ -475,6 +476,81 @@ public:
 } // namespace
 
 namespace {
+class ConvertAtenQuantizePerChannelOp : public OpConversionPattern<AtenQuantizePerChannelOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(AtenQuantizePerChannelOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+
+    Location loc = op->getLoc();
+    MLIRContext *context = op.getContext();
+    Value self = adaptor.getSelf();
+    auto selfRank = adaptor.getSelf().getType().cast<RankedTensorType>().getRank();
+    Type inputDtype = adaptor.getSelf().getType()
+                     .cast<RankedTensorType>()
+                     .getElementType();
+    if (!inputDtype.isa<mlir::FloatType>()) {
+      return rewriter.notifyMatchFailure(op,
+              "input tensor must be floating point dtype for quantization");
+    }
+
+    Type newResultType = getTypeConverter()->convertType(op.getType());
+    Type outputDtype = newResultType.cast<RankedTensorType>().getElementType();
+    llvm::errs() << "Checking output type\n";
+    if (!outputDtype.isa<mlir::IntegerType>()) {
+      return rewriter.notifyMatchFailure(op,
+              "target quantization type must be an integer type");
+    }
+
+    int64_t axis;
+    llvm::errs() << "Checking axis\n";
+    if (!matchPattern(op.getAxis(), m_TorchConstantInt(&axis)))
+      return rewriter.notifyMatchFailure(op,
+                                         "only constant axis supported");
+    llvm::errs() << "Yay\n";
+
+    // Only used to calculate flipped values, i.e. those on the flip axes. Other
+    // dims won't be used.
+    Value initTensor = createZeroInitTensor(
+        rewriter, loc, getTensorSizes(rewriter, loc, self), outputDtype);
+
+    SmallVector<utils::IteratorType> iteratorTypes(
+        selfRank, utils::IteratorType::parallel);
+
+    AffineMap quantAxisMap = AffineMap::get(selfRank, 0, rewriter.getAffineDimExpr(axis), context);
+    AffineMap identity = AffineMap::getMultiDimIdentityMap(selfRank, context);
+
+    SmallVector<AffineMap> indexingMaps{
+            identity, quantAxisMap, quantAxisMap, identity};
+
+    Value quantized =
+        rewriter
+            .create<linalg::GenericOp>(
+                loc, newResultType, ValueRange{self, adaptor.getScales(), adaptor.getZeroPoints()}, initTensor, indexingMaps,
+                iteratorTypes,
+                [&](OpBuilder &b, Location loc, ValueRange args) {
+                  Value lhs = convertScalarToDtype(b, loc, args[0], inputDtype);
+                  Value scale = convertScalarToDtype(b, loc, args[1], inputDtype);
+                  Value scaled = b.create<arith::DivFOp>(loc, lhs, scale);
+                  Value rounded = b.create<math::RoundOp>(loc, scaled);
+                  Type intermediateDtype = b.getIntegerType(cast<mlir::FloatType>(inputDtype).getWidth());
+                  Value fpToI = convertScalarToDtype(b, loc, rounded, intermediateDtype);
+                  Value truncated = convertScalarToDtype(b, loc, fpToI, outputDtype);
+
+                  Value zeroPoint = convertScalarToDtype(b, loc, args[2], outputDtype);
+                  Value add = b.create<arith::AddIOp>(loc, truncated, zeroPoint);
+                  b.create<linalg::YieldOp>(loc, add);
+                })
+            .getResult(0);
+
+    rewriter.replaceOpWithNewOp<tensor::CastOp>(op, newResultType, quantized);
+    return success();
+  }
+};
+} // namespace
+
+namespace {
 class ConvertAtenConvolutionOp : public OpConversionPattern<AtenConvolutionOp> {
 public:
   using OpConversionPattern::OpConversionPattern;
@@ -493,8 +569,8 @@ public:
 
     Type elementType =
         input.getType().cast<RankedTensorType>().getElementType();
-    if (!elementType.isa<mlir::FloatType>())
-      return op.emitError("unimplemented: non-floating point type");
+    //if (!elementType.isa<mlir::FloatType>())
+    //  return op.emitError("unimplemented: non-floating point type");
     size_t inRank = input.getType().cast<RankedTensorType>().getRank();
     size_t numSpacialDims = inRank - 2;
     if (numSpacialDims != 2)
@@ -667,9 +743,9 @@ public:
     Value bias = adaptor.getBias();
     Value outputTensor;
     if (bias.getType().isa<Torch::NoneType>()) {
-      Value c0float = rewriter.create<arith::ConstantOp>(
-          loc, FloatAttr::get(elementType, 0.0));
-      outputTensor = rewriter.create<linalg::FillOp>(loc, c0float, initTensor)
+      Value c0Val = rewriter.create<arith::ConstantOp>(
+            loc, rewriter.getZeroAttr(elementType));
+      outputTensor = rewriter.create<linalg::FillOp>(loc, c0Val, initTensor)
                          .getResult(0);
     } else {
       auto biasType = bias.getType().cast<RankedTensorType>();
@@ -840,6 +916,8 @@ void mlir::torch::torch_to_linalg::populateLinearPatternsAndLegality(
   patterns.add<ConvertAtenMmOp>(typeConverter, context);
   target.addIllegalOp<AtenFlipOp>();
   patterns.add<ConvertAtenFlipOp>(typeConverter, context);
+  target.addIllegalOp<AtenQuantizePerChannelOp>();
+  patterns.add<ConvertAtenQuantizePerChannelOp>(typeConverter, context);
   target.addIllegalOp<AtenMatmulOp>();
   patterns.add<ConvertAtenMatmulOp>(typeConverter, context);
   target.addIllegalOp<AtenBmmOp>();
