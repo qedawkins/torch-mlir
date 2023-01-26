@@ -10659,7 +10659,6 @@ def Torch_AtenQuantizePerTensorOp : Torch_Op<"aten.quantize_per_tensor", [
       printDefaultTorchOp(printer, *this, 4, 1);
     }
   }];
-  let hasCanonicalizer = 1;
 }
 
 def Torch_AtenQuantizePerChannelOp : Torch_Op<"aten.quantize_per_channel", [
@@ -10687,7 +10686,6 @@ def Torch_AtenQuantizePerChannelOp : Torch_Op<"aten.quantize_per_channel", [
       printDefaultTorchOp(printer, *this, 5, 1);
     }
   }];
-  let hasCanonicalizer = 1;
 }
 
 def Torch_AtenIntReprOp : Torch_Op<"aten.int_repr", [

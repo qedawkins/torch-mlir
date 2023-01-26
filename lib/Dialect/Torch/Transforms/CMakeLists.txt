@@ -9,6 +9,7 @@ add_mlir_library(TorchMLIRTorchPasses
   LowerToBackendContract.cpp
   MaximizeValueSemantics.cpp
   PrepareForGlobalizeObjectGraph.cpp
+  QuantizationMaterialization.cpp
   ReduceOpVariants.cpp
   RefinePublicReturn.cpp
   RefineTypes.cpp

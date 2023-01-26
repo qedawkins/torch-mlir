@@ -91,6 +91,9 @@ std::unique_ptr<OperationPass<ModuleOp>> createInlineGlobalSlotsPass();
 
 std::unique_ptr<OperationPass<func::FuncOp>> createReduceOpVariantsPass();
 
+std::unique_ptr<OperationPass<func::FuncOp>>
+createMaterializeQuantizationPass();
+
 std::unique_ptr<OperationPass<func::FuncOp>> createMaximizeValueSemanticsPass();
 
 std::unique_ptr<OperationPass<ModuleOp>> createRefinePublicReturnPass();

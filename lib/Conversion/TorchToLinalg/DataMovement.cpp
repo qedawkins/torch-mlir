@@ -354,9 +354,14 @@ public:
                                          "result shape of rank 0 is invalid");
 
     // TODO: add support for case inputRank 0 expanded to size 1
-    if (inputRank == 0)
-      return rewriter.notifyMatchFailure(
-          op, "unimplemented: input rank 0 is not supported");
+    if (inputRank == 0) {
+      SmallVector<ReassociationIndices> outputAssociations;
+      rewriter
+          .replaceOpWithNewOp<tensor::ExpandShapeOp>(op, resultType, input,
+                                                     outputAssociations)
+          .getResult();
+      return success();
+    }
 
     // Extract the desired output size as a list of integers. This list should
     // have been created using the operation `torch.prim.ListConstruct`.

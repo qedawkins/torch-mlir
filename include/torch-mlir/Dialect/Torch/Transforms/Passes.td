@@ -165,6 +165,15 @@ def ReduceOpVariants : Pass<"torch-reduce-op-variants", "func::FuncOp"> {
   }];
 }
 
+def MaterializeQuantization : Pass<"torch-materialize-quantization", "func::FuncOp"> {
+  let summary = "Commute fake quantization.";
+  let constructor = "mlir::torch::Torch::createMaterializeQuantizationPass()";
+  let description = [{
+    Commutes dequantization with neighboring layers such as Linear and Convolution,
+    thereby enabling quantization to perform the computation in the quantized type.
+  }];
+}
+
 def MaximizeValueSemantics : Pass<"torch-maximize-value-semantics", "func::FuncOp"> {
   let summary = "Use value-semantic tensors where possible.";
   let description = [{

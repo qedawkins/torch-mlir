@@ -113,6 +113,8 @@ void mlir::torch::Torch::createTorchSimplificationPipeline(
   pm.addPass(createSymbolDCEPass());
   // Convert the bulk of non-ABI-visible !torch.tensor's to !torch.vtensor's.
   pm.addNestedPass<func::FuncOp>(Torch::createMaximizeValueSemanticsPass());
+  // Commute fake quantization.
+  pm.addNestedPass<func::FuncOp>(createMaterializeQuantizationPass());
   // Update the return op to return value tensors.
   pm.addPass(Torch::createRefinePublicReturnPass());
   pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());

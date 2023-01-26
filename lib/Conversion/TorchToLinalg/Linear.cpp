@@ -783,8 +783,6 @@ public:
       auto biasType = bias.getType().cast<RankedTensorType>();
       if (biasType.getRank() != 1)
         return rewriter.notifyMatchFailure(op, "expect bias to be rank 1");
-      if (outputElementType != biasType.getElementType())
-        return rewriter.notifyMatchFailure(op, "unimplemented: type promotion");
 
       auto resultRank = initTensor.getType().cast<RankedTensorType>().getRank();
       SmallVector<AffineMap> indexingMaps = {
@@ -794,14 +792,20 @@ public:
           rewriter.getMultiDimIdentityMap(resultRank)};
       SmallVector<utils::IteratorType> iteratorTypes(
           resultRank, utils::IteratorType::parallel);
-      outputTensor = rewriter
-                         .create<linalg::GenericOp>(
-                             loc, initTensor.getType(), bias, initTensor,
-                             indexingMaps, iteratorTypes,
-                             [](OpBuilder &b, Location loc, ValueRange args) {
-                               b.create<linalg::YieldOp>(loc, args[0]);
-                             })
-                         .getResult(0);
+      outputTensor =
+          rewriter
+              .create<linalg::GenericOp>(
+                  loc, initTensor.getType(), bias, initTensor, indexingMaps,
+                  iteratorTypes,
+                  [&](OpBuilder &b, Location loc, ValueRange args) {
+                    Value result = args[0];
+                    if (outputElementType != biasType.getElementType()) {
+                      result = convertScalarToDtype(b, loc, result,
+                                                    outputElementType);
+                    }
+                    b.create<linalg::YieldOp>(loc, result);
+                  })
+              .getResult(0);
     }
 
     auto stridesAttr = rewriter.getI64VectorAttr(strideInts);
