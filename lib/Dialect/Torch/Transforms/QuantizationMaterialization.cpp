@@ -212,15 +212,100 @@ public:
 
     auto tensorOperands = llvm::to_vector<6>(
         llvm::make_filter_range(op->getOperands(), [](Value v) {
-          return v.getType().isa<RankedTensorType>();
+          return v.getType().isa<Torch::ValueTensorType>();
         }));
 
-    assert(tensorOperands.size() == 1 && "Found more than one argument tensor");
+    assert(tensorOperands.size() == 1 && "Found non-singular tensor arguments");
     return commuteTensorOperand(rewriter, op, tensorOperands[0],
                                 /*annotate=*/true);
   }
 };
 } // namespace
+
+namespace {
+class CommuteAtenCatOp : public OpRewritePattern<AtenCatOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(AtenCatOp op,
+                                PatternRewriter &rewriter) const override {
+
+    llvm::errs() << "Commuting cat\n";
+    if (op->hasAttr(quantizedMarker)) {
+      return rewriter.notifyMatchFailure(op, "cat op already quantized.");
+    }
+
+    llvm::errs() << "checking list\n";
+    auto tensorList = op.getTensors();
+    SmallVector<Value> tensorVector;
+    if (!getListConstructElements(tensorList, tensorVector))
+      return op.emitError(
+          "unimplemented: the tensor list is not from list construct");
+
+    assert(tensorVector.size() > 0 &&
+           "Expecting to have non-zero number of concatenated vectors");
+    llvm::errs() << "asserted size\n";
+
+    SmallVector<Value> mulScaleValues;
+    SmallVector<Value> subZeroPointValues;
+    SmallVector<Value> quantizedSources;
+    AtenSubTensorOp subZeroPoint;
+    AtenMulTensorOp mulScale;
+    for (auto tensor : tensorVector) {
+      llvm::errs() << "checking mul\n";
+      tensor.getDefiningOp()->dump();
+      if (!(mulScale = tensor.getDefiningOp<AtenMulTensorOp>()) ||
+          !mulScale->hasAttr(mulScaleMarker)) {
+        return rewriter.notifyMatchFailure(
+            op, "aten cat input isn't from dequantization multiply");
+      }
+      mulScaleValues.push_back(mulScale.getOther());
+
+      llvm::errs() << "checking sub\n";
+      mulScale.getSelf().getDefiningOp()->dump();
+      if (!(subZeroPoint =
+                mulScale.getSelf().getDefiningOp<AtenSubTensorOp>()) ||
+          !subZeroPoint->hasAttr(subZeroPointMarker)) {
+        return rewriter.notifyMatchFailure(op,
+                                           "aten cat dequantization scaling "
+                                           "doesn't come from sub zero point ");
+      }
+      subZeroPointValues.push_back(subZeroPoint.getOther());
+      quantizedSources.push_back(subZeroPoint.getSelf());
+    }
+    llvm::errs() << "found zero points\n";
+
+    if (!std::equal(mulScaleValues.begin() + 1, mulScaleValues.end(),
+                    mulScaleValues.begin()))
+      return op.emitError(
+          "unimplemented: concatenated tensors with non-homogenous scale");
+
+    if (!std::equal(subZeroPointValues.begin() + 1, subZeroPointValues.end(),
+                    subZeroPointValues.begin()))
+      return op.emitError(
+          "unimplemented: concatenated tensors with non-homogenous zero point");
+
+    llvm::errs() << "all equal\n";
+
+    auto loc = op->getLoc();
+    auto newTensorList = rewriter.create<PrimListConstructOp>(
+        loc, tensorList.getType(), quantizedSources);
+    auto newCatOp = rewriter.create<AtenCatOp>(loc, op.getType(), newTensorList,
+                                               op.getDim());
+    auto newSub = rewriter.create<AtenSubTensorOp>(
+        loc, subZeroPoint.getType(), newCatOp.getResult(),
+        subZeroPoint.getOther(), subZeroPoint.getAlpha());
+    auto newMul = rewriter.create<AtenMulTensorOp>(
+        loc, mulScale.getType(), newSub.getResult(), mulScale.getOther());
+
+    newMul->setAttr(mulScaleMarker, rewriter.getUnitAttr());
+    newSub->setAttr(subZeroPointMarker, rewriter.getUnitAttr());
+    newCatOp->setAttr(quantizedMarker, rewriter.getUnitAttr());
+    rewriter.replaceOp(op, newMul.getResult());
+
+    return success();
+  }
+};
+} // end namespace
 
 // =====================================
 // Quantize Convolutions
@@ -360,6 +445,8 @@ public:
 
       patterns.add<CommuteUnaryLinearOp<AtenMaxPool2dOp>>(context);
       patterns.add<CommuteUnaryLinearOp<AtenUpsampleNearest2dOp>>(context);
+      patterns.add<CommuteUnaryLinearOp<AtenSliceTensorOp>>(context);
+      patterns.add<CommuteAtenCatOp>(context);
 
       if (failed(applyPatternsAndFoldGreedily(getOperation(),
                                               std::move(patterns)))) {

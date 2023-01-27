@@ -598,8 +598,12 @@ public:
 
     Type elementType =
         input.getType().cast<RankedTensorType>().getElementType();
-    // if (!elementType.isa<mlir::FloatType>())
-    //   return op.emitError("unimplemented: non-floating point type");
+    if (elementType !=
+        weight.getType().cast<RankedTensorType>().getElementType()) {
+      return rewriter.notifyMatchFailure(
+          op,
+          "unimplemented: differing element types between inputs and weights");
+    }
     size_t inRank = input.getType().cast<RankedTensorType>().getRank();
     size_t numSpacialDims = inRank - 2;
     if (numSpacialDims != 2)

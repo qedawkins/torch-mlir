@@ -154,18 +154,28 @@ public:
       return rewriter.notifyMatchFailure(op, "invalid pooling parameters");
 
     Type elementType = self.getType().cast<RankedTensorType>().getElementType();
-    auto smallestFPValueAttr = rewriter.getFloatAttr(
-        elementType,
-        APFloat::getLargest(
-            elementType.cast<mlir::FloatType>().getFloatSemantics(),
-            /*Negative=*/true));
+    Attribute smallestValueAttr;
+    if (elementType.isa<mlir::FloatType>()) {
+      smallestValueAttr = rewriter.getFloatAttr(
+          elementType,
+          APFloat::getLargest(
+              elementType.cast<mlir::FloatType>().getFloatSemantics(),
+              /*Negative=*/true));
+    } else if (elementType.isa<mlir::IntegerType>()) {
+      smallestValueAttr = rewriter.getIntegerAttr(
+          elementType, APInt::getSignedMinValue(
+                           elementType.cast<mlir::IntegerType>().getWidth()));
+    } else {
+      return rewriter.notifyMatchFailure(
+          op, "unimplemented: non-floating point or integer type");
+    }
     SmallVector<Value, 4> outTensorShape;
     // `maxpool2d` contains the result of maxpool2d operation over the input.
     Value maxPool2d, paddedInput;
     if (failed(createPoolingOp<linalg::PoolingNchwMaxOp>(
-            op, rewriter, self, /*supportNonFPInput=*/false, ceilMode,
+            op, rewriter, self, /*supportNonFPInput=*/true, ceilMode,
             kernelSizeIntValues, strideInts, paddingInts, dilationInts,
-            smallestFPValueAttr, outTensorShape, paddedInput, maxPool2d)))
+            smallestValueAttr, outTensorShape, paddedInput, maxPool2d)))
       return rewriter.notifyMatchFailure(op, "unable to compute maxpool2d");
     Type newResultType = getTypeConverter()->convertType(op.getType());
     rewriter.replaceOpWithNewOp<tensor::CastOp>(op, newResultType, maxPool2d);
