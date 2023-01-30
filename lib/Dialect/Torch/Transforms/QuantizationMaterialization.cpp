@@ -229,12 +229,10 @@ public:
   LogicalResult matchAndRewrite(AtenCatOp op,
                                 PatternRewriter &rewriter) const override {
 
-    llvm::errs() << "Commuting cat\n";
     if (op->hasAttr(quantizedMarker)) {
       return rewriter.notifyMatchFailure(op, "cat op already quantized.");
     }
 
-    llvm::errs() << "checking list\n";
     auto tensorList = op.getTensors();
     SmallVector<Value> tensorVector;
     if (!getListConstructElements(tensorList, tensorVector))
@@ -243,7 +241,6 @@ public:
 
     assert(tensorVector.size() > 0 &&
            "Expecting to have non-zero number of concatenated vectors");
-    llvm::errs() << "asserted size\n";
 
     SmallVector<Value> mulScaleValues;
     SmallVector<Value> subZeroPointValues;
@@ -251,8 +248,6 @@ public:
     AtenSubTensorOp subZeroPoint;
     AtenMulTensorOp mulScale;
     for (auto tensor : tensorVector) {
-      llvm::errs() << "checking mul\n";
-      tensor.getDefiningOp()->dump();
       if (!(mulScale = tensor.getDefiningOp<AtenMulTensorOp>()) ||
           !mulScale->hasAttr(mulScaleMarker)) {
         return rewriter.notifyMatchFailure(
@@ -260,8 +255,6 @@ public:
       }
       mulScaleValues.push_back(mulScale.getOther());
 
-      llvm::errs() << "checking sub\n";
-      mulScale.getSelf().getDefiningOp()->dump();
       if (!(subZeroPoint =
                 mulScale.getSelf().getDefiningOp<AtenSubTensorOp>()) ||
           !subZeroPoint->hasAttr(subZeroPointMarker)) {
@@ -272,7 +265,6 @@ public:
       subZeroPointValues.push_back(subZeroPoint.getOther());
       quantizedSources.push_back(subZeroPoint.getSelf());
     }
-    llvm::errs() << "found zero points\n";
 
     if (!std::equal(mulScaleValues.begin() + 1, mulScaleValues.end(),
                     mulScaleValues.begin()))
@@ -283,8 +275,6 @@ public:
                     subZeroPointValues.begin()))
       return op.emitError(
           "unimplemented: concatenated tensors with non-homogenous zero point");
-
-    llvm::errs() << "all equal\n";
 
     auto loc = op->getLoc();
     auto newTensorList = rewriter.create<PrimListConstructOp>(
