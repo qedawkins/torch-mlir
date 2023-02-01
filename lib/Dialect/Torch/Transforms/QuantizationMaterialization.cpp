@@ -35,9 +35,9 @@ materializeQType(torch_upstream::ScalarType t) {
   if (t == torch_upstream::ScalarType::QInt8)
     return torch_upstream::ScalarType::Char;
   if (t == torch_upstream::ScalarType::QUInt8)
-    return torch_upstream::ScalarType::Char;
+    return torch_upstream::ScalarType::Byte;
   if (t == torch_upstream::ScalarType::QInt32)
-    return torch_upstream::ScalarType::Char;
+    return torch_upstream::ScalarType::Int;
   return t;
 }
 

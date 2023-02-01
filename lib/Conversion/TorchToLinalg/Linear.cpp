@@ -503,6 +503,12 @@ public:
       return rewriter.notifyMatchFailure(
           op, "target quantization type must be an integer type");
     }
+    bool isSigned = op.getType()
+                        .cast<Torch::ValueTensorType>()
+                        .getDtype()
+                        .cast<IntegerType>()
+                        .isSigned();
+    auto outputIntType = outputDtype.cast<mlir::IntegerType>();
 
     int64_t axis;
     if (!matchPattern(op.getAxis(), m_TorchConstantInt(&axis)))
@@ -545,25 +551,33 @@ public:
                   Value shifted =
                       b.create<arith::AddIOp>(loc, fpToI, zeroPoint);
 
+                  Value minClamp = shifted;
+                  // if (isSigned) {
                   Value quantMin = b.create<arith::ConstantOp>(
                       loc,
                       b.getIntegerAttr(
                           intermediateDtype,
-                          llvm::minIntN(cast<mlir::IntegerType>(outputDtype)
-                                            .getWidth())));
-                  Value quantMax = b.create<arith::ConstantOp>(
-                      loc,
-                      b.getIntegerAttr(
-                          intermediateDtype,
-                          llvm::maxIntN(cast<mlir::IntegerType>(outputDtype)
-                                            .getWidth())));
+                          isSigned ? llvm::minIntN(outputIntType.getWidth())
+                                   : 0));
                   Value minCompare = b.create<arith::CmpIOp>(
-                      loc, arith::CmpIPredicate::slt, shifted, quantMin);
-                  Value minClamp = b.create<arith::SelectOp>(loc, minCompare,
-                                                             quantMin, shifted);
+                      loc,
+                      isSigned ? arith::CmpIPredicate::slt
+                               : arith::CmpIPredicate::ult,
+                      shifted, quantMin);
+                  minClamp = b.create<arith::SelectOp>(loc, minCompare,
+                                                       quantMin, shifted);
+                  //}
 
+                  auto maxInt = isSigned
+                                    ? llvm::maxIntN(outputIntType.getWidth())
+                                    : llvm::maxUIntN(outputIntType.getWidth());
+                  Value quantMax = b.create<arith::ConstantOp>(
+                      loc, b.getIntegerAttr(intermediateDtype, maxInt));
                   Value maxCompare = b.create<arith::CmpIOp>(
-                      loc, arith::CmpIPredicate::sgt, minClamp, quantMax);
+                      loc,
+                      isSigned ? arith::CmpIPredicate::sgt
+                               : arith::CmpIPredicate::ugt,
+                      minClamp, quantMax);
                   Value maxClamp = b.create<arith::SelectOp>(
                       loc, maxCompare, quantMax, minClamp);
 

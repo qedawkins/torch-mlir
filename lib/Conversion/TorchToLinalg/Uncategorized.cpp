@@ -390,8 +390,12 @@ static Value createLinalgPayloadCalculationForElementwiseOp(
     Type dtype = converter->convertType(sub.getType())
                      .cast<RankedTensorType>()
                      .getElementType();
-    Value lhs = convertScalarToDtype(b, loc, payloadArgs[0], dtype);
-    Value rhs = convertScalarToDtype(b, loc, payloadArgs[1], dtype);
+    Value lhs = convertScalarToDtype(
+        b, loc, payloadArgs[0], dtype,
+        sub.getSelf().getType().cast<Torch::ValueTensorType>().getDtype());
+    Value rhs = convertScalarToDtype(
+        b, loc, payloadArgs[1], dtype,
+        sub.getOther().getType().cast<Torch::ValueTensorType>().getDtype());
     Value alpha = convertScalarToDtype(b, loc, adaptor.getAlpha(), dtype);
     if (dtype.isa<mlir::FloatType>()) {
       Value scaled = b.create<arith::MulFOp>(loc, rhs, alpha);
@@ -1014,6 +1018,14 @@ static Value createLinalgPayloadCalculationForElementwiseOp(
           "target quantization type must be an integer type");
       return nullptr;
     }
+    bool isSigned = quantizePerTensor.getResult()
+                        .getType()
+                        .cast<Torch::ValueTensorType>()
+                        .getDtype()
+                        .cast<IntegerType>()
+                        .isSigned();
+    auto outputIntType = outputDtype.cast<mlir::IntegerType>();
+
     Value lhs = convertScalarToDtype(b, loc, payloadArgs[0], inputDtype);
     Value scale = convertScalarToDtype(b, loc, operands[1], inputDtype);
     Value scaled = b.create<arith::DivFOp>(loc, lhs, scale);
@@ -1026,27 +1038,23 @@ static Value createLinalgPayloadCalculationForElementwiseOp(
         convertScalarToDtype(b, loc, operands[2], intermediateDtype);
     Value shifted = b.create<arith::AddIOp>(loc, fpToI, zeroPoint);
 
-    Value quantMin = b.create<arith::ConstantOp>(
-        loc,
-        b.getIntegerAttr(
-            intermediateDtype,
-            llvm::minIntN(cast<mlir::IntegerType>(outputDtype).getWidth())));
-    Value quantMax = b.create<arith::ConstantOp>(
-        loc,
-        b.getIntegerAttr(
-            intermediateDtype,
-            llvm::maxIntN(cast<mlir::IntegerType>(outputDtype).getWidth())));
-    Value minCompare = createComparisonTemplate<arith::CmpFPredicate::ULT,
-                                                arith::CmpIPredicate::ult,
-                                                arith::CmpIPredicate::slt>(
-        b, loc, intermediateDtype, shifted, quantMin);
-    Value minClamp =
-        b.create<arith::SelectOp>(loc, minCompare, quantMin, shifted);
+    Value minClamp = shifted;
+    if (isSigned) {
+      Value quantMin = b.create<arith::ConstantOp>(
+          loc, b.getIntegerAttr(intermediateDtype,
+                                llvm::minIntN(outputIntType.getWidth())));
+      Value minCompare = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt,
+                                                 shifted, quantMin);
+      minClamp = b.create<arith::SelectOp>(loc, minCompare, quantMin, shifted);
+    }
 
-    Value maxCompare = createComparisonTemplate<arith::CmpFPredicate::UGT,
-                                                arith::CmpIPredicate::ugt,
-                                                arith::CmpIPredicate::sgt>(
-        b, loc, intermediateDtype, minClamp, quantMax);
+    auto maxInt = isSigned ? llvm::maxIntN(outputIntType.getWidth())
+                           : llvm::maxUIntN(outputIntType.getWidth());
+    Value quantMax = b.create<arith::ConstantOp>(
+        loc, b.getIntegerAttr(intermediateDtype, maxInt));
+    Value maxCompare = b.create<arith::CmpIOp>(
+        loc, isSigned ? arith::CmpIPredicate::sgt : arith::CmpIPredicate::ugt,
+        minClamp, quantMax);
     Value maxClamp =
         b.create<arith::SelectOp>(loc, maxCompare, quantMax, minClamp);
 
