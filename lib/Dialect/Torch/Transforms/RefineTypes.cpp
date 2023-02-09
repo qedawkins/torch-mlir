@@ -617,13 +617,21 @@ static Type getPromotedResultTypeAssumingNonZeroRank(
 
 static Type getPromotedResultTypeAssumingNonZeroRankWithQuantizedPromotion(
     MLIRContext *context, ArrayRef<const ValueKnowledge *> tensors) {
-  auto promotedType =
-      getPromotedResultTypeAssumingNonZeroRank(context, tensors);
-  if (promotedType.isSignedInteger(8))
+  bool allQuant = true;
+  torch_upstream::ResultTypeState state = {};
+  for (auto tensor : tensors) {
+    if (!tensor->dtype)
+      return Type();
+    if (!tensor->dtype.isInteger(8))
+      allQuant = false;
+    state = updateResultTypeState(tensor, /*rankIsNonZero=*/true, state,
+                                  /*skipRankCheck=*/true);
+  }
+  if (allQuant)
     return mlir::IntegerType::get(context, 32, IntegerType::Signed);
-  if (promotedType.isUnsignedInteger(8))
-    return mlir::IntegerType::get(context, 32, IntegerType::Unsigned);
-  return promotedType;
+
+  FailureOr<Type> result = getTypeForScalarType(context, result_type(state));
+  return failed(result) ? Type() : *result;
 }
 
 void TypeAnalysis::fillInDTypeGivenDTypeIntAndInputDType(

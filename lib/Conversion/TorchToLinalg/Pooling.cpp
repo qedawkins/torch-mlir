@@ -60,6 +60,99 @@ checkAndGetPoolingParameters(OpTy op, ConversionPatternRewriter &rewriter,
 
 // Creates a pooling operation based on the type specified by `OpTy` and
 // arguments passed.
+static LogicalResult createUnsignedMaxPoolingOp(
+    Operation *op, ConversionPatternRewriter &rewriter, Value self,
+    bool supportNonFPInput, bool ceilMode,
+    SmallVectorImpl<Value> &kernelSizeIntValues,
+    SmallVectorImpl<int64_t> &strideInts, SmallVectorImpl<int64_t> &paddingInts,
+    SmallVectorImpl<int64_t> &dilationInts, Attribute initValueAttr,
+    SmallVectorImpl<Value> &outTensorShape, Value &paddedInput, Value &result) {
+  Location loc = op->getLoc();
+  Type elementType = self.getType().cast<RankedTensorType>().getElementType();
+  if (!elementType.isa<mlir::FloatType>() && !supportNonFPInput)
+    return op->emitError("unimplemented: non-floating point type");
+
+  SmallVector<int64_t, 4> lowPaddingIncludingNC = {0, 0};
+  lowPaddingIncludingNC.append(paddingInts);
+  SmallVector<int64_t, 4> highPaddingIncludingNC = lowPaddingIncludingNC;
+  if (ceilMode) {
+    highPaddingIncludingNC[2] += strideInts[0];
+    highPaddingIncludingNC[3] += strideInts[1];
+  }
+  Value initValue = rewriter.create<arith::ConstantOp>(loc, initValueAttr);
+  paddedInput = torch_to_linalg::getPaddedTensor(
+      op, rewriter, self, lowPaddingIncludingNC, highPaddingIncludingNC,
+      initValue);
+
+  Value N = getDimOp(rewriter, loc, self, 0);
+  Value C = getDimOp(rewriter, loc, self, 1);
+  Value H = getDimOp(rewriter, loc, self, 2);
+  Value W = getDimOp(rewriter, loc, self, 3);
+
+  SmallVector<Value> paddingIntValues =
+      getAsConstantIntValues(rewriter, loc, paddingInts);
+  SmallVector<Value> dilationIntValues =
+      getAsConstantIntValues(rewriter, loc, dilationInts);
+  SmallVector<Value> strideIntValues =
+      getAsConstantIntValues(rewriter, loc, strideInts);
+
+  Value hOut = torch_to_linalg::getOutputDimForConvOps(
+      rewriter, loc, H, paddingIntValues[0], dilationIntValues[0],
+      kernelSizeIntValues[0], strideIntValues[0], ceilMode);
+  Value wOut = torch_to_linalg::getOutputDimForConvOps(
+      rewriter, loc, W, paddingIntValues[1], dilationIntValues[1],
+      kernelSizeIntValues[1], strideIntValues[1], ceilMode);
+
+  // Create output tensor initialized with smallest floating point value.
+  outTensorShape.insert(outTensorShape.begin(), {N, C, hOut, wOut});
+  Value outTensorInitialized =
+      createInitTensor(rewriter, loc, outTensorShape, elementType, initValue);
+
+  auto shape = castIntVectorToIndexVector(rewriter, loc, kernelSizeIntValues);
+  Value windowTensor = rewriter.create<tensor::EmptyOp>(
+      loc, getAsOpFoldResult(shape), elementType);
+
+  SmallVector<utils::IteratorType> iteratorTypes{
+      utils::IteratorType::parallel,  utils::IteratorType::parallel,
+      utils::IteratorType::parallel,  utils::IteratorType::parallel,
+      utils::IteratorType::reduction, utils::IteratorType::reduction};
+
+  AffineExpr nDim, ocDim, ohDim, owDim, ihDim, iwDim;
+  bindDims(op->getContext(), nDim, ocDim, ohDim, owDim, ihDim, iwDim);
+
+  auto shSym = rewriter.getAffineConstantExpr(strideInts[0]);
+  auto swSym = rewriter.getAffineConstantExpr(strideInts[1]);
+
+  auto dhSym = rewriter.getAffineConstantExpr(dilationInts[0]);
+  auto dwSym = rewriter.getAffineConstantExpr(dilationInts[1]);
+
+  SmallVector<AffineExpr, 4> inputExprs = {nDim, ocDim,
+                                           ohDim * shSym + ihDim * dhSym,
+                                           owDim * swSym + iwDim * dwSym};
+  SmallVector<AffineExpr, 4> filterExprs = {ihDim, iwDim};
+  SmallVector<AffineExpr, 4> outputExprs = {nDim, ocDim, ohDim, owDim};
+
+  SmallVector<AffineMap, 4> indexingMaps = {
+      AffineMap::get(6, 0, inputExprs, rewriter.getContext()),
+      AffineMap::get(6, 0, filterExprs, rewriter.getContext()),
+      AffineMap::get(6, 0, outputExprs, rewriter.getContext())};
+
+  result = rewriter
+               .create<linalg::GenericOp>(
+                   loc, outTensorInitialized.getType(),
+                   ValueRange{paddedInput, windowTensor}, outTensorInitialized,
+                   indexingMaps, iteratorTypes,
+                   [&](OpBuilder &b, Location loc, ValueRange args) {
+                     auto max = b.create<arith::MaxUIOp>(loc, args[0], args[2]);
+                     b.create<linalg::YieldOp>(loc, max.getResult());
+                   })
+               .getResult(0);
+
+  return success();
+}
+
+// Creates a pooling operation based on the type specified by `OpTy` and
+// arguments passed.
 template <typename OpTy>
 static LogicalResult createPoolingOp(
     Operation *op, ConversionPatternRewriter &rewriter, Value self,
@@ -154,6 +247,8 @@ public:
       return rewriter.notifyMatchFailure(op, "invalid pooling parameters");
 
     Type elementType = self.getType().cast<RankedTensorType>().getElementType();
+    Type dtype =
+        op.getSelf().getType().cast<Torch::ValueTensorType>().getDtype();
     Attribute smallestValueAttr;
     if (elementType.isa<mlir::FloatType>()) {
       smallestValueAttr = rewriter.getFloatAttr(
@@ -162,9 +257,11 @@ public:
               elementType.cast<mlir::FloatType>().getFloatSemantics(),
               /*Negative=*/true));
     } else if (elementType.isa<mlir::IntegerType>()) {
+      auto intWidth = elementType.cast<mlir::IntegerType>().getWidth();
       smallestValueAttr = rewriter.getIntegerAttr(
-          elementType, APInt::getSignedMinValue(
-                           elementType.cast<mlir::IntegerType>().getWidth()));
+          elementType, dtype.isUnsignedInteger()
+                           ? APInt::getZero(intWidth)
+                           : APInt::getSignedMinValue(intWidth));
     } else {
       return rewriter.notifyMatchFailure(
           op, "unimplemented: non-floating point or integer type");
@@ -172,11 +269,19 @@ public:
     SmallVector<Value, 4> outTensorShape;
     // `maxpool2d` contains the result of maxpool2d operation over the input.
     Value maxPool2d, paddedInput;
-    if (failed(createPoolingOp<linalg::PoolingNchwMaxOp>(
-            op, rewriter, self, /*supportNonFPInput=*/true, ceilMode,
-            kernelSizeIntValues, strideInts, paddingInts, dilationInts,
-            smallestValueAttr, outTensorShape, paddedInput, maxPool2d)))
-      return rewriter.notifyMatchFailure(op, "unable to compute maxpool2d");
+    if (dtype.isUnsignedInteger()) {
+      if (failed(createUnsignedMaxPoolingOp(
+              op, rewriter, self, /*supportNonFPInput=*/true, ceilMode,
+              kernelSizeIntValues, strideInts, paddingInts, dilationInts,
+              smallestValueAttr, outTensorShape, paddedInput, maxPool2d)))
+        return rewriter.notifyMatchFailure(op, "unable to compute maxpool2d");
+    } else {
+      if (failed(createPoolingOp<linalg::PoolingNchwMaxOp>(
+              op, rewriter, self, /*supportNonFPInput=*/true, ceilMode,
+              kernelSizeIntValues, strideInts, paddingInts, dilationInts,
+              smallestValueAttr, outTensorShape, paddedInput, maxPool2d)))
+        return rewriter.notifyMatchFailure(op, "unable to compute maxpool2d");
+    }
     Type newResultType = getTypeConverter()->convertType(op.getType());
     rewriter.replaceOpWithNewOp<tensor::CastOp>(op, newResultType, maxPool2d);
     return success();

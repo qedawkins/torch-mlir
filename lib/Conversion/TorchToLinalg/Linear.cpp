@@ -849,12 +849,86 @@ public:
     Value conv;
     if (groupSize == 1) {
       // TODO: add 1D and 3D case
-      conv =
-          rewriter
-              .create<linalg::Conv2DNchwFchwOp>(
-                  loc, outputTensor.getType(), ValueRange{paddedInput, weight},
-                  outputTensor, stridesAttr, dilationAttr)
-              .getResult(0);
+      auto inElementType = dyn_cast<IntegerType>(
+          op.getInput().getType().cast<Torch::ValueTensorType>().getDtype());
+      auto weightElementType = dyn_cast<IntegerType>(
+          op.getWeight().getType().cast<Torch::ValueTensorType>().getDtype());
+      auto outElementType = dyn_cast<IntegerType>(
+          op.getResult().getType().cast<Torch::ValueTensorType>().getDtype());
+
+      // Check if we need to construct the generic ourselves to get the correct
+      // sign promotion.
+      if (inElementType && weightElementType && outElementType &&
+          ((inElementType.isUnsigned() &&
+            inElementType.getWidth() < outElementType.getWidth()) ||
+           (weightElementType.isUnsigned() &&
+            weightElementType.getWidth() < outElementType.getWidth()))) {
+        SmallVector<utils::IteratorType> iteratorTypes{
+            utils::IteratorType::parallel,  utils::IteratorType::parallel,
+            utils::IteratorType::parallel,  utils::IteratorType::parallel,
+            utils::IteratorType::reduction, utils::IteratorType::reduction,
+            utils::IteratorType::reduction};
+
+        AffineExpr nDim, fDim, khDim, kwDim, icDim, ohDim, owDim;
+        bindDims(getContext(), nDim, fDim, ohDim, owDim, icDim, khDim, kwDim);
+
+        auto shSym = rewriter.getAffineConstantExpr(strideInts[0]);
+        auto swSym = rewriter.getAffineConstantExpr(strideInts[1]);
+
+        auto dhSym = rewriter.getAffineConstantExpr(dilationInts[0]);
+        auto dwSym = rewriter.getAffineConstantExpr(dilationInts[1]);
+
+        SmallVector<AffineExpr, 4> inputExprs = {nDim, icDim,
+                                                 ohDim * shSym + khDim * dhSym,
+                                                 owDim * swSym + kwDim * dwSym};
+        SmallVector<AffineExpr, 4> filterExprs = {fDim, icDim, khDim, kwDim};
+        SmallVector<AffineExpr, 4> outputExprs = {nDim, fDim, ohDim, owDim};
+
+        SmallVector<AffineMap, 4> indexingMaps = {
+            AffineMap::get(7, 0, inputExprs, rewriter.getContext()),
+            AffineMap::get(7, 0, filterExprs, rewriter.getContext()),
+            AffineMap::get(7, 0, outputExprs, rewriter.getContext())};
+
+        conv = rewriter
+                   .create<linalg::GenericOp>(
+                       loc, outputTensor.getType(),
+                       ValueRange{paddedInput, weight}, outputTensor,
+                       indexingMaps, iteratorTypes,
+                       [&](OpBuilder &b, Location loc, ValueRange args) {
+                         Value inExt = args[0];
+                         if (inElementType.getWidth() <
+                             outElementType.getWidth()) {
+                           if (inElementType.isUnsigned())
+                             inExt = b.create<arith::ExtUIOp>(
+                                 loc, outputElementType, args[0]);
+                           else
+                             inExt = b.create<arith::ExtSIOp>(
+                                 loc, outputElementType, args[0]);
+                         }
+                         Value weightExt = args[1];
+                         if (weightElementType.getWidth() <
+                             outElementType.getWidth()) {
+                           if (weightElementType.isUnsigned())
+                             weightExt = b.create<arith::ExtUIOp>(
+                                 loc, outputElementType, args[1]);
+                           else
+                             weightExt = b.create<arith::ExtSIOp>(
+                                 loc, outputElementType, args[1]);
+                         }
+                         auto mul =
+                             b.create<arith::MulIOp>(loc, inExt, weightExt);
+                         auto add = b.create<arith::AddIOp>(loc, mul, args[2]);
+                         b.create<linalg::YieldOp>(loc, add.getResult());
+                       })
+                   .getResult(0);
+      } else {
+        conv = rewriter
+                   .create<linalg::Conv2DNchwFchwOp>(
+                       loc, outputTensor.getType(),
+                       ValueRange{paddedInput, weight}, outputTensor,
+                       stridesAttr, dilationAttr)
+                   .getResult(0);
+      }
     } else {
       // Special depthwise case
       auto inShape = makeShapeTorchCompatible(
