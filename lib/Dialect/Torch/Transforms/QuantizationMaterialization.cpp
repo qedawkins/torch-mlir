@@ -93,6 +93,26 @@ static LogicalResult commuteTensorOperand(PatternRewriter &rewriter,
   return success();
 }
 
+static LogicalResult passThroughTensorOperand(PatternRewriter &rewriter,
+                                          Operation *op, Value tensorOperand) {
+  AtenMulTensorOp mulScale;
+  if (!(mulScale = tensorOperand.getDefiningOp<AtenMulTensorOp>()) ||
+      !mulScale->hasAttr(mulScaleMarker)) {
+    return rewriter.notifyMatchFailure(
+        op, "op input isn't from dequantization multiply");
+  }
+
+  AtenSubTensorOp subZeroPoint;
+  if (!(subZeroPoint = mulScale.getSelf().getDefiningOp<AtenSubTensorOp>()) ||
+      !subZeroPoint->hasAttr(subZeroPointMarker)) {
+    return rewriter.notifyMatchFailure(
+        op, "dequantization scaling doesn't come from sub zero point ");
+  }
+
+  op->replaceUsesOfWith(mulScale.getResult(), subZeroPoint.getSelf());
+  return success();
+}
+
 // =====================================
 // Materialize Integer Types
 // =====================================
@@ -218,6 +238,29 @@ public:
     assert(tensorOperands.size() == 1 && "Found non-singular tensor arguments");
     return commuteTensorOperand(rewriter, op, tensorOperands[0],
                                 /*annotate=*/true);
+  }
+};
+} // namespace
+
+namespace {
+template <typename OpTy>
+class PassThroughUnaryOp : public OpRewritePattern<OpTy> {
+public:
+  using OpRewritePattern<OpTy>::OpRewritePattern;
+  LogicalResult matchAndRewrite(OpTy op,
+                                PatternRewriter &rewriter) const override {
+    if (op->hasAttr(quantizedMarker)) {
+      return rewriter.notifyMatchFailure(op,
+                                         "unary linear op already quantized.");
+    }
+
+    auto tensorOperands = llvm::to_vector<6>(
+        llvm::make_filter_range(op->getOperands(), [](Value v) {
+          return v.getType().isa<Torch::ValueTensorType>();
+        }));
+
+    assert(tensorOperands.size() == 1 && "Found non-singular tensor arguments");
+    return passThroughTensorOperand(rewriter, op, tensorOperands[0]);
   }
 };
 } // namespace
@@ -436,6 +479,10 @@ public:
       patterns.add<CommuteUnaryLinearOp<AtenMaxPool2dOp>>(context);
       patterns.add<CommuteUnaryLinearOp<AtenUpsampleNearest2dOp>>(context);
       patterns.add<CommuteUnaryLinearOp<AtenSliceTensorOp>>(context);
+      patterns.add<CommuteUnaryLinearOp<AtenViewOp>>(context);
+      patterns.add<CommuteUnaryLinearOp<AtenPermuteOp>>(context);
+      patterns.add<CommuteUnaryLinearOp<AtenContiguousOp>>(context);
+      patterns.add<PassThroughUnaryOp<AtenSizeIntOp>>(context);
       patterns.add<CommuteAtenCatOp>(context);
 
       if (failed(applyPatternsAndFoldGreedily(getOperation(),
