@@ -829,6 +829,7 @@ def Torch_DerefineOp : Torch_Op<"derefine", [
 }
 
 def Torch_OperatorOp : Torch_Op<"operator", [
+    ReadOnly,
     AllowsTypeRefinement
   ]> {
   let summary = "Opaque torch operator";
