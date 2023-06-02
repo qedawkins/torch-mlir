@@ -427,7 +427,6 @@ public:
   LogicalResult
   matchAndRewrite(OperatorOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    llvm::outs() << op.getName().str() << "\n";
     if (op.getName().str() != "brevitas.matmul_rhs_group_quant") {
       return failure();
     }
@@ -454,18 +453,60 @@ public:
 
     Value scales = adaptor.getOperands()[2];
     Value zps = adaptor.getOperands()[3];
-    Value unpackedtypewidth = adaptor.getOperands()[4];
+    Value unpackedTypeWidth = adaptor.getOperands()[4];
     Value group_size = adaptor.getOperands()[5];
 
-    auto castOp = dyn_cast<mlir::UnrealizedConversionCastOp>(group_size.getDefiningOp());
-    if (!castOp) {
+    auto getConstantIntegerFromDefiningOp = [](Value operand,
+                                               int &extractedInt) {
+      auto castOp =
+          dyn_cast<mlir::UnrealizedConversionCastOp>(operand.getDefiningOp());
+      if (!castOp) {
+        return failure();
+      }
+      auto constOp =
+          dyn_cast<Torch::ConstantIntOp>(castOp.getOperand(0).getDefiningOp());
+      if (!constOp) {
+        return failure();
+      }
+      extractedInt = constOp.getValue();
+      return success();
+    };
+
+    int gs;
+    if (failed(getConstantIntegerFromDefiningOp(group_size, gs)))
       return failure();
-    }
-    auto groupConstOp = dyn_cast<Torch::ConstantIntOp>(castOp.getOperand(0).getDefiningOp());
-    if (!groupConstOp) {
+
+    int unpackedBitWidth;
+    if (failed(getConstantIntegerFromDefiningOp(unpackedTypeWidth,
+                                                unpackedBitWidth)))
       return failure();
-    }
-    int gs = groupConstOp.getValue();
+
+    if (unpackedBitWidth != rhs_elementType.getIntOrFloatBitWidth())
+      return failure();
+
+    llvm::errs() << "Group size: " << gs << "\n";
+    llvm::errs() << "Unpacked bit width: " << unpackedBitWidth << "\n";
+
+    //// Scale the inner most dim of the RHS by the packing ratio.
+    // rhs_reduct_dim_size *= 8 / unpackedBitWidth;
+    // rhs_elementType = rewriter.getIntegerType(unpackedBitWidth);
+    // auto rhsCast = q_rhs.getDefiningOp<UnrealizedConversionCastOp>();
+    // if (!rhsCast)
+    //   return failure();
+
+    // auto rhsValueTensorLiteral =
+    // rhsCast.getOperand(0).getDefiningOp<ValueTensorLiteralOp>(); if
+    // (!rhsValueTensorLiteral)
+    //   return failure();
+
+    // rhsValueTensorLiteral->setAttr("__unpacked_bit_width__",
+    // rewriter.getI64IntegerAttr(unpackedBitWidth)); if (unpackedBitWidth != 8)
+    // {
+    //   rhsType = RankedTensorType::get({rhsShape[0], rhs_reduct_dim_size},
+    //   rhs_elementType); q_rhs =
+    //   rewriter.create<UnrealizedConversionCastOp>(op.getLoc(), rhsType,
+    //   op.getOperand(1)).getResult(0);
+    // }
 
     // get outputs
     Type newResultType = getTypeConverter()->convertType(op.getType(0));
@@ -476,13 +517,15 @@ public:
     auto resultShape = resultType.getShape();
     Type elementType = resultType.getElementType();
 
-    std::vector<int64_t> lhs_expandedShape = {lhsShape[0], lhsShape[1], lhs_reduct_dim_size/gs, gs};
+    SmallVector<int64_t> lhs_expandedShape = {lhsShape[0], lhsShape[1],
+                                              lhs_reduct_dim_size / gs, gs};
     RankedTensorType lhs_expandedType = RankedTensorType::get(lhs_expandedShape, elementType);
     SmallVector<ReassociationIndices, 4> lhs_reassociation = {{0}, {1}, {2, 3}};
     Value expanded_lhs = rewriter.create<tensor::ExpandShapeOp>(
       loc, lhs_expandedType, lhs, lhs_reassociation);
 
-    std::vector<int64_t> expandedShape = {rhsShape[0], rhs_reduct_dim_size/gs, gs};
+    SmallVector<int64_t> expandedShape = {rhsShape[0], rhs_reduct_dim_size / gs,
+                                          gs};
     Value dq_empty = rewriter.create<tensor::EmptyOp>(
       loc, expandedShape, elementType);
 
