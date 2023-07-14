@@ -955,7 +955,6 @@ def Torch_ValueTensorLiteralOp : Torch_Op<"vtensor.literal", [
   }];
 
   let hasFolder = 1;
-  let hasCanonicalizer = 1;
 }
 
 def Torch_TensorStaticInfoCastOp : Torch_Op<"tensor_static_info_cast", [
