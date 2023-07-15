@@ -10,6 +10,7 @@
 #include "PassDetail.h"
 
 #include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchDialect.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchOps.h"
 #include "torch-mlir/Dialect/TorchConversion/IR/TorchConversionOps.h"
@@ -19,9 +20,13 @@ using namespace mlir;
 using namespace mlir::torch;
 using namespace mlir::torch::Torch;
 
-void populatePackedTensorPatterns(
-    RewritePatternSet &patterns, MLIRContext *context) {
-  patterns.add(+[](ValueTensorLiteralOp constOp, PatternRewriter &rewriter) {
+namespace {
+class UnPackQuantizedMatmulWeights
+    : public OpRewritePattern<ValueTensorLiteralOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(ValueTensorLiteralOp constOp,
+                                PatternRewriter &rewriter) const override {
     if (!constOp->hasOneUse())
       return failure();
 
@@ -105,23 +110,27 @@ void populatePackedTensorPatterns(
         constOp, newRhsType,
         DenseElementsAttr::get(attrType, ArrayRef<APInt>(newData)));
     return success();
-  });
-}
+  }
+};
+} // namespace
 
 namespace {
 class UnpackTorchTensorPass
     : public TorchConversion::UnpackTorchTensorBase<UnpackTorchTensorPass> {
   using UnpackTorchTensorBase<UnpackTorchTensorPass>::UnpackTorchTensorBase;
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<func::FuncDialect>();
+    registry.insert<Torch::TorchDialect>();
+  }
 
   void runOnOperation() override {
     MLIRContext *context = &getContext();
-    ConversionTarget target(*context);
-    target.addLegalDialect<Torch::TorchDialect, func::FuncDialect>();
 
     RewritePatternSet patterns(context);
-    populatePackedTensorPatterns(patterns, context);
+    patterns.add<UnPackQuantizedMatmulWeights>(context);
 
-    if (failed(applyPartialConversion(getOperation(), target, std::move(patterns))))
+    if (failed(
+            applyPatternsAndFoldGreedily(getOperation(), std::move(patterns))))
       signalPassFailure();
   }
 };
