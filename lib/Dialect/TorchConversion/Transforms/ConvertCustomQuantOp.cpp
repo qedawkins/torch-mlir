@@ -101,10 +101,18 @@ public:
     Type elementType = resultType.getElementType();
 
     // expand lhs
-    std::vector<int64_t> lhsExpandedShape = {lhsShape[0], lhsShape[1],
-                                             lhsReductDimSize / gs, gs};
-    RankedTensorType lhsExpandedType = RankedTensorType::get(lhsExpandedShape, elementType);
-    SmallVector<ReassociationIndices, 4> lhsReassociation = {{0}, {1}, {2, 3}};
+    std::vector<int64_t> lhsExpandedShape;
+    SmallVector<ReassociationIndices, 4> lhsReassociation;
+    int lhsRank = lhsShape.size();
+    for (int i = 0, e = lhsRank - 1; i < e; i++) {
+      lhsExpandedShape.push_back(lhsShape[i]);
+      lhsReassociation.push_back({i});
+    }
+    lhsExpandedShape.push_back(lhsReductDimSize / gs);
+    lhsExpandedShape.push_back(gs);
+    lhsReassociation.push_back({lhsRank - 1, lhsRank});
+    RankedTensorType lhsExpandedType =
+        RankedTensorType::get(lhsExpandedShape, elementType);
     Value lhsExpanded = rewriter.create<tensor::ExpandShapeOp>(
       loc, lhsExpandedType, lhs, lhsReassociation);
 
@@ -130,23 +138,51 @@ public:
     Value output = rewriter.create<linalg::FillOp>(
       loc, cst0, empty).getResult(0);
 
-    AffineExpr d0, d1, d2, d3, d4;
-    bindDims(getContext(), d0, d1, d2, d3, d4);
+    MLIRContext *context = rewriter.getContext();
+    SmallVector<AffineExpr> dimList(lhsRank + 2);
+    bindDimsList(context, MutableArrayRef{dimList});
+    auto d0 = dimList[0];
+    auto d1 = dimList[1];
+    auto d2 = dimList[2];
     auto c0 = rewriter.getAffineConstantExpr(0);
-    auto map = AffineMap::get(3, 0, {d0, d1, d2}, rewriter.getContext());
-    auto map1 = AffineMap::get(3, 0, {d0, d1, c0}, rewriter.getContext());
-    auto map2 = AffineMap::get(5, 0, {d0, d1, d3, d4}, rewriter.getContext());
-    auto map3 = AffineMap::get(5, 0, {d2, d3, d4}, rewriter.getContext());
-    auto map4 = AffineMap::get(5, 0, {d0, d1, d2}, rewriter.getContext());
-    SmallVector<AffineMap, 4> dqIndexingMaps = {map, map1, map1, map};
+    // Construct maps for the dequantization.
+    int64_t scaleRank = scales.getType().cast<RankedTensorType>().getRank();
+    int64_t zpRank = zps.getType().cast<RankedTensorType>().getRank();
+    auto map = AffineMap::get(3, 0, {d0, d1, d2}, context);
+    auto mapScale =
+        AffineMap::get(3, 0,
+                       scaleRank == 3 ? SmallVector<AffineExpr>{d0, d1, c0}
+                                      : SmallVector<AffineExpr>{d0, d1},
+                       context);
+    auto mapZp =
+        AffineMap::get(3, 0,
+                       zpRank == 3 ? SmallVector<AffineExpr>{d0, d1, c0}
+                                   : SmallVector<AffineExpr>{d0, d1},
+                       context);
+
+    SmallVector<AffineExpr> lhsExprs;
+    SmallVector<AffineExpr> rhsExprs;
+    SmallVector<AffineExpr> outExprs;
+    for (int i = 0, e = lhsRank + 2; i < e; ++i) {
+      auto expr = dimList[i];
+      if (i != lhsRank - 1)
+        lhsExprs.push_back(expr);
+      if (i >= lhsRank - 1)
+        rhsExprs.push_back(expr);
+      if (i <= lhsRank - 1)
+        outExprs.push_back(expr);
+    }
+    auto map2 = AffineMap::get(lhsRank + 2, 0, lhsExprs, context);
+    auto map3 = AffineMap::get(lhsRank + 2, 0, rhsExprs, context);
+    auto map4 = AffineMap::get(lhsRank + 2, 0, outExprs, context);
+    SmallVector<AffineMap, 4> dqIndexingMaps = {map, mapScale, mapZp, map};
     SmallVector<AffineMap, 4> matIndexingMaps = {map2, map3, map4};
 
     SmallVector<utils::IteratorType> dequantIteratorTypes(3, utils::IteratorType::parallel);
-    SmallVector<utils::IteratorType> matmulIteratorTypes = {
-      utils::IteratorType::parallel, utils::IteratorType::parallel,
-      utils::IteratorType::parallel, utils::IteratorType::reduction,
-      utils::IteratorType::reduction
-    };
+    SmallVector<utils::IteratorType> matmulIteratorTypes(
+        lhsRank, utils::IteratorType::parallel);
+    matmulIteratorTypes.push_back(utils::IteratorType::reduction);
+    matmulIteratorTypes.push_back(utils::IteratorType::reduction);
 
     Value rhsDequant =
         rewriter
@@ -158,7 +194,8 @@ public:
                 [&](OpBuilder &b, Location loc, ValueRange args) {
                   Value w = args[0], scale = args[1], zeroPoint = args[2];
                   Value extw = b.create<arith::ExtUIOp>(loc, rewriter.getI32Type(), w);
-                  Value fp_extw = b.create<arith::UIToFPOp>(loc, rewriter.getF16Type(), extw);
+                  Value fp_extw = b.create<arith::UIToFPOp>(
+                      loc, rewriter.getF32Type(), extw);
                   Value shifted = b.create<arith::SubFOp>(loc, fp_extw, zeroPoint);
                   Value dqw = b.create<arith::MulFOp>(loc, shifted, scale);
                   b.create<linalg::YieldOp>(loc, dqw);
